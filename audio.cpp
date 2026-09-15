@@ -2,16 +2,16 @@
 #include "logger.h"
 #include "timer.h"
 #include <fstream>
-#include <sstream>
-#include <cstdlib>
 #include <cstring>
+#include <cstdlib>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
 
 using namespace std;
 
-AudioRecorder::AudioRecorder(int chunk_seconds)
-    : chunk_seconds_(chunk_seconds) {
-    paths_[0] = "/tmp/voice_chunk_a.wav";
-    paths_[1] = "/tmp/voice_chunk_b.wav";
+AudioRecorder::AudioRecorder(int sample_rate, int max_seconds)
+    : sample_rate_(sample_rate), max_samples_((size_t)max_seconds * sample_rate) {
 }
 
 AudioRecorder::~AudioRecorder() {
@@ -21,93 +21,144 @@ AudioRecorder::~AudioRecorder() {
 bool AudioRecorder::start() {
     if (worker_.joinable()) return true;
     worker_ = thread([this] { worker(); });
-    Logger::log("RECORD", "Background recorder started ("
-                + to_string(chunk_seconds_) + "s chunks)");
+    Logger::log("RECORD", "Continuous recorder started ("
+                + to_string(sample_rate_) + " Hz, ring "
+                + to_string(max_samples_ / sample_rate_) + "s)");
     return true;
 }
 
 void AudioRecorder::shutdown() {
     {
-        unique_lock<mutex> lock(mtx_);
+        lock_guard<mutex> lock(mtx_);
         stop_ = true;
     }
-    cv_free_.notify_all();
-    cv_ready_.notify_all();
+    if (pipe_) {
+        fclose(pipe_); // closes our read end; child gets SIGPIPE on next write
+        pipe_ = nullptr;
+    }
+    if (child_pid_ > 0) {
+        kill(child_pid_, SIGTERM);
+        waitpid(child_pid_, nullptr, 0);
+        child_pid_ = -1;
+    }
     if (worker_.joinable()) {
         worker_.join();
     }
     Logger::log("RECORD", "Recorder stopped");
 }
 
-string AudioRecorder::next() {
-    unique_lock<mutex> lock(mtx_);
-    cv_ready_.wait(lock, [this] { return stop_ || ready_[0] || ready_[1]; });
-    if (stop_) return "";
-
-    // Pick the oldest ready chunk to preserve order.
-    int slot = -1;
-    uint64_t oldest = ~0ULL;
-    for (int i = 0; i < 2; i++) {
-        if (ready_[i] && seq_[i] < oldest) {
-            oldest = seq_[i];
-            slot = i;
-        }
-    }
-    if (slot < 0) return "";
-
-    ready_[slot] = false;
-    consumed_ = slot;
-    last_ok_ = ok_[slot];
-    return paths_[slot];
+uint64_t AudioRecorder::sample_count() const {
+    lock_guard<mutex> lock(mtx_);
+    return total_;
 }
 
-void AudioRecorder::release() {
-    unique_lock<mutex> lock(mtx_);
-    if (consumed_ >= 0) {
-        free_[consumed_] = true;
-        consumed_ = -1;
-        cv_free_.notify_one();
-    }
+AudioBuffer AudioRecorder::slice(uint64_t from_sample, uint64_t to_sample) const {
+    AudioBuffer audio;
+    audio.sample_rate = sample_rate_;
+    lock_guard<mutex> lock(mtx_);
+    // The ring only holds the most recent max_samples_ samples.
+    uint64_t avail_from = total_ > samples_.size() ? total_ - samples_.size() : 0;
+    uint64_t s = from_sample > avail_from ? from_sample : avail_from;
+    uint64_t e = to_sample < total_ ? to_sample : total_;
+    if (e <= s) return audio;
+    size_t off = static_cast<size_t>(s - avail_from);
+    audio.samples.assign(samples_.begin() + off,
+                         samples_.begin() + off + static_cast<size_t>(e - s));
+    return audio;
 }
 
-bool AudioRecorder::record_to(const string& path) {
-    Timer timer("RECORD");
+// Spawn the command with stdout connected to a pipe. Returns false on failure.
+bool AudioRecorder::open_pipe(const string& cmd) {
+    int fds[2];
+    if (pipe(fds) != 0) return false;
 
-    ostringstream cmd;
-    cmd << "arecord -f S16_LE -r 16000 -c 1 -d " << chunk_seconds_
-        << " \"" << path << "\" 2>/dev/null";
-
-    if (system(cmd.str().c_str()) == 0) {
-        return true;
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return false;
+    }
+    if (pid == 0) {
+        // Child: replace stdout with the write end of the pipe.
+        dup2(fds[1], STDOUT_FILENO);
+        close(fds[0]);
+        close(fds[1]);
+        execl("/bin/sh", "sh", "-c", cmd.c_str(), (char*)nullptr);
+        _exit(127);
     }
 
-    Logger::log("RECORD", "arecord failed, trying ffmpeg...");
-    ostringstream cmd2;
-    cmd2 << "ffmpeg -f alsa -i default -ar 16000 -ac 1 -t " << chunk_seconds_
-         << " \"" << path << "\" -y 2>/dev/null";
-    return system(cmd2.str().c_str()) == 0;
+    close(fds[1]);
+    pipe_ = fdopen(fds[0], "r");
+    child_pid_ = (int)pid;
+    return pipe_ != nullptr;
 }
 
 void AudioRecorder::worker() {
-    unique_lock<mutex> lock(mtx_);
+    string arecord = "arecord -q -f S16_LE -r " + to_string(sample_rate_)
+                     + " -c 1 -t raw";
+    string ffmpeg = "ffmpeg -loglevel error -f alsa -i default -ac 1 -ar "
+                    + to_string(sample_rate_) + " -f s16le pipe:1";
 
+    bool fallback_tried = false;
+
+    {
+        lock_guard<mutex> lock(mtx_);
+        ok_ = open_pipe(arecord);
+    }
+    if (!ok_) {
+        Logger::log("RECORD", "arecord unavailable, trying ffmpeg...");
+        lock_guard<mutex> lock(mtx_);
+        ok_ = open_pipe(ffmpeg);
+        fallback_tried = true;
+    }
+    if (!ok_) {
+        Logger::log("RECORD", "ERROR: failed to open audio input (arecord/ffmpeg)");
+        return;
+    }
+
+    vector<short> chunk(4096);
     while (true) {
-        cv_free_.wait(lock, [this] { return stop_ || free_[0] || free_[1]; });
-        if (stop_) break;
-
-        int slot = free_[0] ? 0 : 1;
-        free_[slot] = false;
-        string path = paths_[slot];
-
-        lock.unlock();
-
-        bool ok = record_to(path);
-
-        lock.lock();
-        ok_[slot] = ok;
-        seq_[slot] = next_seq_++;
-        ready_[slot] = true;
-        cv_ready_.notify_one();
+        {
+            lock_guard<mutex> lock(mtx_);
+            if (stop_) break;
+        }
+        size_t got = fread(chunk.data(), sizeof(short), chunk.size(), pipe_);
+        if (got == 0) {
+            bool stopping = false;
+            {
+                lock_guard<mutex> lock(mtx_);
+                stopping = stop_;
+            }
+            if (stopping) break;
+            // Capture ended (or arecord is missing): try ffmpeg once.
+            fclose(pipe_);
+            pipe_ = nullptr;
+            if (child_pid_ > 0) {
+                kill(child_pid_, SIGTERM);
+                waitpid(child_pid_, nullptr, 0);
+                child_pid_ = -1;
+            }
+            if (fallback_tried) {
+                Logger::log("RECORD", "Audio input closed unexpectedly");
+                break;
+            }
+            Logger::log("RECORD", "arecord stopped, switching to ffmpeg...");
+            lock_guard<mutex> lock(mtx_);
+            ok_ = open_pipe(ffmpeg);
+            fallback_tried = true;
+            if (!ok_) break;
+            continue;
+        }
+        lock_guard<mutex> lock(mtx_);
+        for (size_t i = 0; i < got; i++) {
+            samples_.push_back(chunk[i] / 32768.0f);
+        }
+        total_ += got;
+        // Trim the ring to the last max_samples_.
+        if (samples_.size() > max_samples_) {
+            samples_.erase(samples_.begin(),
+                           samples_.begin() + (samples_.size() - max_samples_));
+        }
     }
 }
 

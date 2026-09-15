@@ -3,7 +3,6 @@
 #include <vector>
 #include <thread>
 #include <mutex>
-#include <condition_variable>
 
 using namespace std;
 
@@ -12,45 +11,41 @@ struct AudioBuffer {
     int sample_rate = 0;
 };
 
-// Background recorder: continuously records fixed-length chunks into two
-// rotating WAV files so that recording of the next chunk overlaps with the
-// consumer processing the current one.
+// Continuous recorder: captures audio from the microphone into an in-memory
+// ring of the last max_seconds seconds. Consumers slice out arbitrary spans
+// with slice(), so the decode region can start at the committed frontier and
+// only grow on the tail.
 class AudioRecorder {
 public:
-    explicit AudioRecorder(int chunk_seconds);
+    // sample_rate is fixed (16000 Hz), max_seconds bounds memory usage.
+    explicit AudioRecorder(int sample_rate, int max_seconds);
     ~AudioRecorder();
 
-    bool start();    // spawn the background recorder thread
-    void shutdown(); // stop the thread and join it
+    bool start();    // spawn the capture thread (arecord, fallback ffmpeg)
+    void shutdown(); // stop the child and join the thread
 
-    // Blocks until the next chunk has finished recording and returns its path
-    // ("" when stopped).
-    string next();
-    // Marks the most recently consumed chunk as reusable.
-    void release();
-    // Whether the most recent chunk recorded successfully.
-    bool last_ok() const { return last_ok_; }
+    // Total audio samples captured so far.
+    uint64_t sample_count() const;
+    // Copy of audio in [from_sample, to_sample) (clamped to what exists).
+    AudioBuffer slice(uint64_t from_sample, uint64_t to_sample) const;
 
 private:
     void worker();
-    bool record_to(const string& path);
+    // Spawn `cmd` with its stdout connected to a pipe we read.
+    bool open_pipe(const string& cmd);
 
-    int chunk_seconds_;
-    string paths_[2];
-    bool free_[2] = { true, true };
-    bool ready_[2] = { false, false };
-    bool ok_[2] = { false, false };
-    uint64_t seq_[2] = { 0, 0 };
-    uint64_t next_seq_ = 1;
+    int sample_rate_;
+    size_t max_samples_;
 
-    mutex mtx_;
-    condition_variable cv_free_;
-    condition_variable cv_ready_;
+    vector<float> samples_; // ring: last max_samples_ samples
+    uint64_t total_ = 0;
+
+    bool ok_ = false;
     bool stop_ = false;
     thread worker_;
-
-    int consumed_ = -1;
-    bool last_ok_ = false;
+    FILE* pipe_ = nullptr;
+    int child_pid_ = -1;
+    mutable mutex mtx_;
 };
 
 AudioBuffer load_wav(const string& path);

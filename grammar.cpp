@@ -66,6 +66,10 @@ bool LlamaCorrector::init(const string& model_path) {
     sampler_ = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(sampler_, llama_sampler_init_top_k(40));
     llama_sampler_chain_add(sampler_, llama_sampler_init_top_p(0.95f, 1));
+    // Penalize repeated tokens (applied after top-k/top-p so it stays fast).
+    // Small low-quant models fall into "Hello. Hello. Hello. ..." echo loops;
+    // a moderate repeat penalty forces them to move on and hit EOG instead.
+    llama_sampler_chain_add(sampler_, llama_sampler_init_penalties(64, 1.30f, 0.0f, 0.0f));
     llama_sampler_chain_add(sampler_, llama_sampler_init_temp(0.3f));
     llama_sampler_chain_add(sampler_, llama_sampler_init_dist(12345));
 
@@ -132,7 +136,7 @@ string LlamaCorrector::correct(const string& raw_text) {
     llama_sampler_reset(sampler_);
 
     string response;
-    const int max_tokens = 256;
+    const int max_tokens = 128;
     int n_gen = 0;
     llama_pos n_pos = static_cast<llama_pos>(n_prompt);
 
@@ -153,6 +157,25 @@ string LlamaCorrector::correct(const string& raw_text) {
             response.append(piece, n);
         }
 
+        // Corrections are a single line: stop at the first newline.
+        if (response.find('\n') != string::npos) {
+            Logger::log("LLAMA", "Stopping at newline");
+            break;
+        }
+
+        // Backstop against echo loops: if the tail of the response already
+        // appeared earlier, the model is stuck repeating itself.
+        if ((int) response.size() >= 48) {
+            const size_t win = 24;
+            size_t prev =
+                response.rfind(response.substr(response.size() - win),
+                               response.size() - win - 1);
+            if (prev != string::npos) {
+                Logger::log("LLAMA", "Stopping at repeated text");
+                break;
+            }
+        }
+
         batch.n_tokens = 1;
         batch.token[0] = new_token;
         batch.pos[0] = n_pos;
@@ -167,11 +190,6 @@ string LlamaCorrector::correct(const string& raw_text) {
 
         n_pos++;
         n_gen++;
-
-        if (n_gen > 10 && response.find('\n') != string::npos) {
-            Logger::log("LLAMA", "Stopping at newline");
-            break;
-        }
     }
 
     auto t3 = chrono::high_resolution_clock::now();
