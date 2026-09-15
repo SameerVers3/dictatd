@@ -1,2 +1,4 @@
 *.o
 voice_pipeline
+stream_toggle
+hotkey

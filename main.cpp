@@ -45,65 +45,93 @@ int main(int argc, char** argv) {
     Logger::log("MAIN", "Whisper model: " + whisper_model);
     Logger::log("MAIN", "LLama model:   " + llama_model);
     Logger::log("MAIN", "Chunk duration: " + to_string(chunk_seconds) + "s");
+    Logger::log("MAIN", "Models are loaded once at startup; recording overlaps with transcription.");
     Logger::log("MAIN", "Press Ctrl+C to stop");
     Logger::log("MAIN", "========================================");
-    
+
+    WhisperEngine whisper;
+    if (!whisper.init(whisper_model)) {
+        Logger::log("MAIN", "FATAL: failed to load whisper model");
+        return 1;
+    }
+
+    LlamaCorrector llama;
+    if (!llama.init(llama_model)) {
+        Logger::log("MAIN", "FATAL: failed to load llama model");
+        return 1;
+    }
+
+    AudioRecorder recorder(chunk_seconds);
+    if (!recorder.start()) {
+        Logger::log("MAIN", "FATAL: failed to start recorder");
+        return 1;
+    }
+
     int chunk_num = 0;
-    
+
     while (g_running) {
         chunk_num++;
         cout << "\n";
-        
+
         Logger::log("MAIN", "========== CHUNK #" + to_string(chunk_num) + " ==========");
-        
-        string wav_path = "/tmp/voice_chunk_" + to_string(chunk_num) + ".wav";
-        
-        bool record_ok = false;
-        
+
+        string wav_path;
         {
             Timer record_timer("RECORD");
-            Logger::log("RECORD", "Recording " + to_string(chunk_seconds)
-                        + " second audio chunk...");
-            record_ok = record_audio_chunk(wav_path, chunk_seconds);
+            Logger::log("RECORD", "Waiting for the next " + to_string(chunk_seconds)
+                        + "s chunk (recording overlaps with processing of the previous one)...");
+            wav_path = recorder.next();
         }
-        
-        if (!record_ok) {
+
+        if (wav_path.empty()) {
+            Logger::log("RECORD", "ERROR: Recorder stopped unexpectedly");
+            break;
+        }
+
+        if (!recorder.last_ok()) {
             Logger::log("RECORD", "ERROR: Recording failed. Make sure 'arecord' or 'ffmpeg' is installed.");
             Logger::log("MAIN", "Hint: sudo apt install alsa-utils   # for arecord");
             Logger::log("MAIN", "      sudo apt install ffmpeg       # for ffmpeg");
+            recorder.release();
             break;
         }
-        
-        string raw_text = transcribe_with_whisper(wav_path, whisper_model);
-        
-        if (raw_text.empty()) {
-            Logger::log("MAIN", "Transcription failed, skipping grammar correction");
-            continue;
+
+        string raw_text = whisper.transcribe(wav_path);
+
+        // The WAV file has been read; free the buffer slot now so the next
+        // chunk can be recorded while grammar correction is still running.
+        recorder.release();
+
+        string corrected_text = raw_text;
+
+        if (!raw_text.empty()) {
+            corrected_text = llama.correct(raw_text);
+        } else {
+            Logger::log("MAIN", "Transcription empty, skipping grammar correction");
         }
 
-        
-        string corrected_text = correct_grammar_with_llama(raw_text, llama_model);
-        
         if (corrected_text.empty()) {
             Logger::log("MAIN", "Grammar correction failed, using raw transcription");
             corrected_text = raw_text;
         }
-        
+
         cout << "\n";
-        
+
         Logger::log("RESULT", "RAW:        \"" + raw_text + "\"");
         Logger::log("RESULT", "CORRECTED:  \"" + corrected_text + "\"");
-        
+
         cout << "\n";
-        
+
         Logger::log("MAIN", "========== END CHUNK #" + to_string(chunk_num) + " ==========");
     }
 
+    recorder.shutdown();
+
     cout << "\n";
-    
+
     Logger::log("MAIN", "Shutdown signal received. Exiting...");
     Logger::log("MAIN", "Total chunks processed: " + to_string(chunk_num));
     Logger::log("MAIN", "Goodbye!");
-    
+
     return 0;
 }

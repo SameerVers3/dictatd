@@ -1,5 +1,6 @@
 #include "audio.h"
 #include "logger.h"
+#include "timer.h"
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
@@ -7,20 +8,107 @@
 
 using namespace std;
 
-bool record_audio_chunk(const string& output_path, int duration_sec) {
+AudioRecorder::AudioRecorder(int chunk_seconds)
+    : chunk_seconds_(chunk_seconds) {
+    paths_[0] = "/tmp/voice_chunk_a.wav";
+    paths_[1] = "/tmp/voice_chunk_b.wav";
+}
+
+AudioRecorder::~AudioRecorder() {
+    shutdown();
+}
+
+bool AudioRecorder::start() {
+    if (worker_.joinable()) return true;
+    worker_ = thread([this] { worker(); });
+    Logger::log("RECORD", "Background recorder started ("
+                + to_string(chunk_seconds_) + "s chunks)");
+    return true;
+}
+
+void AudioRecorder::shutdown() {
+    {
+        unique_lock<mutex> lock(mtx_);
+        stop_ = true;
+    }
+    cv_free_.notify_all();
+    cv_ready_.notify_all();
+    if (worker_.joinable()) {
+        worker_.join();
+    }
+    Logger::log("RECORD", "Recorder stopped");
+}
+
+string AudioRecorder::next() {
+    unique_lock<mutex> lock(mtx_);
+    cv_ready_.wait(lock, [this] { return stop_ || ready_[0] || ready_[1]; });
+    if (stop_) return "";
+
+    // Pick the oldest ready chunk to preserve order.
+    int slot = -1;
+    uint64_t oldest = ~0ULL;
+    for (int i = 0; i < 2; i++) {
+        if (ready_[i] && seq_[i] < oldest) {
+            oldest = seq_[i];
+            slot = i;
+        }
+    }
+    if (slot < 0) return "";
+
+    ready_[slot] = false;
+    consumed_ = slot;
+    last_ok_ = ok_[slot];
+    return paths_[slot];
+}
+
+void AudioRecorder::release() {
+    unique_lock<mutex> lock(mtx_);
+    if (consumed_ >= 0) {
+        free_[consumed_] = true;
+        consumed_ = -1;
+        cv_free_.notify_one();
+    }
+}
+
+bool AudioRecorder::record_to(const string& path) {
+    Timer timer("RECORD");
+
     ostringstream cmd;
-    cmd << "arecord -f S16_LE -r 16000 -c 1 -d " << duration_sec
-        << " \"" << output_path << "\" 2>/dev/null";
-    Logger::log("RECORD", "Executing: " + cmd.str());
+    cmd << "arecord -f S16_LE -r 16000 -c 1 -d " << chunk_seconds_
+        << " \"" << path << "\" 2>/dev/null";
+
     if (system(cmd.str().c_str()) == 0) {
         return true;
     }
+
     Logger::log("RECORD", "arecord failed, trying ffmpeg...");
     ostringstream cmd2;
-    cmd2 << "ffmpeg -f alsa -i default -ar 16000 -ac 1 -t " << duration_sec
-         << " \"" << output_path << "\" -y 2>/dev/null";
-    Logger::log("RECORD", "Executing: " + cmd2.str());
+    cmd2 << "ffmpeg -f alsa -i default -ar 16000 -ac 1 -t " << chunk_seconds_
+         << " \"" << path << "\" -y 2>/dev/null";
     return system(cmd2.str().c_str()) == 0;
+}
+
+void AudioRecorder::worker() {
+    unique_lock<mutex> lock(mtx_);
+
+    while (true) {
+        cv_free_.wait(lock, [this] { return stop_ || free_[0] || free_[1]; });
+        if (stop_) break;
+
+        int slot = free_[0] ? 0 : 1;
+        free_[slot] = false;
+        string path = paths_[slot];
+
+        lock.unlock();
+
+        bool ok = record_to(path);
+
+        lock.lock();
+        ok_[slot] = ok;
+        seq_[slot] = next_seq_++;
+        ready_[slot] = true;
+        cv_ready_.notify_one();
+    }
 }
 
 AudioBuffer load_wav(const string& path) {
