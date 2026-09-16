@@ -80,6 +80,10 @@ bool LlamaCorrector::init(const string& model_path) {
 string LlamaCorrector::correct(const string& raw_text) {
     Timer timer("LLAMA");
 
+    // Each correction is an independent request: wipe the KV cache so the new
+    // prompt (positions from 0) can't collide with the previous request's.
+    llama_memory_clear(llama_get_memory(ctx_), false);
+
     string prompt =
         "Correct the grammar and spelling of the following text. "
         "Only output the corrected text, nothing else.\n\n"

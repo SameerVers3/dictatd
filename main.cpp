@@ -166,6 +166,13 @@ private:
 
             Logger::log("RESULT", "RAW:        \"" + text + "\"");
             Logger::log("RESULT", "CORRECTED:  \"" + corrected + "\"");
+
+            // Type the corrected text into whichever field has focus.
+            FILE* wt = popen("wtype -", "w");
+            if (wt) {
+                fwrite(corrected.c_str(), 1, corrected.size(), wt);
+                pclose(wt);
+            }
         }
     }
 
@@ -198,10 +205,15 @@ int main(int argc, char** argv) {
     string whisper_model = argv[1];
     string llama_model = argv[2];
 
-    // Tunables for the streaming decode loop.
-    const double min_region_s = 1.0;
-    const double cadence_s = 1.5;
-    const double settle_s = 0.4;
+    // Dictation is processed in fixed-length audio chunks. Each chunk is
+    // transcribed on the main thread while the recorder thread keeps
+    // capturing the next chunk in the ring, so listening never stops.
+    const double kChunkSeconds = 5.0;
+
+    // Pauses/silence below this RMS skip transcription entirely. Feeding a
+    // silent chunk (with the prompt context) makes whisper-basemodels
+    // hallucinate repeats of the last sentence on the empty audio.
+    const double kSilenceRms = 0.005;
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -238,60 +250,57 @@ int main(int argc, char** argv) {
 
     bool active = false;
     double from_s = 0.0;        // committed frontier, seconds
-    double last_decode_s = -1;  // last time we ran a decode pass
     string committed_all;       // rolling text of everything committed so far
     string pending;             // committed but not yet sent to the corrector
     int quiet_ticks = 0;
     uint64_t n_ticks = 0;
 
-    // One streaming decode pass. A pass commits every settled segment and
-    // re-decodes only the unsettled tail with more future context. With
-    // force=true (used when stopping a session) every segment is committed so
-    // nothing in the utterance is lost.
-    auto run_decode = [&](bool force) {
+    // Transcribe one fixed-length chunk [from_s, from_s + kChunkSeconds).
+    // The recorder thread keeps capturing the next chunk in the ring while
+    // whisper runs, so a chunk is always waiting when this finishes. With
+    // final=true (on hotkey release) whatever audio remains is transcribed.
+    auto run_decode = [&](bool final) {
         double now_s = (double)recorder.sample_count() / kSampleRate;
-        double region = now_s - from_s;
-        last_decode_s = now_s;
+        double end = final ? now_s : min(from_s + kChunkSeconds, now_s);
+        if (end - from_s < 0.25) return;
         n_ticks++;
 
         Logger::log("MAIN", "===== TICK #" + to_string(n_ticks)
                     + " decode [" + to_string((long long)from_s)
-                    + "s, " + to_string((long long)now_s) + "s) =====");
+                    + "s, " + to_string((long long)end) + "s) =====");
 
         AudioBuffer clip = recorder.slice((uint64_t)(from_s * kSampleRate),
-                                          (uint64_t)(now_s * kSampleRate));
+                                          (uint64_t)(end * kSampleRate));
+
+        // Gate on silence so empty chunks don't reach whisper (it would
+        // hallucinate repeats of the prompt context). Advance the frontier
+        // and wait for the next chunk instead.
+        double rms = 0.0;
+        for (float v : clip.samples) rms += v * v;
+        rms = clip.samples.empty() ? 0.0 : sqrt(rms / clip.samples.size());
+        if (rms < kSilenceRms) {
+            Logger::log("MAIN", "chunk [" + to_string((long long)from_s)
+                        + "s, " + to_string((long long)end)
+                        + "s) is silent (rms=" + to_string(rms)
+                        + "), skipping");
+            from_s = end;
+            quiet_ticks++;
+            return;
+        }
+
         auto segs = whisper.transcribe(clip.samples, clip.sample_rate,
                                        prompt_context(committed_all, 300));
 
-        double threshold = force ? now_s : (now_s - settle_s);
         string new_text;
-        double new_from = from_s;
-
         for (const auto& sg : segs) {
-            double e = from_s + sg.t1;
-
-            // Only settled segments are committed; the tail is re-decoded next
-            // pass once more future audio exists.
-            if (!force && e > threshold) continue;
-
             if (!new_text.empty() && sg.text[0] != '.' && sg.text[0] != ','
                 && sg.text[0] != '!' && sg.text[0] != '?' && sg.text[0] != ';') {
                 new_text += ' ';
             }
             new_text += sg.text;
-            new_from = max(new_from, e);
         }
 
-        // Skip dead air so the region doesn't grow unbounded during silence.
-        if (!force && new_text.empty() && segs.empty() && region > 8.0) {
-            new_from = now_s;
-        }
-        // During continuous speech with no paused segments, bound the region
-        // so decode cost (and latency) can't grow without limit.
-        if (!force && new_text.empty() && !segs.empty() && region > 12.0) {
-            new_from = now_s - settle_s;
-        }
-        from_s = new_from;
+        from_s = end;
 
         if (!new_text.empty()) {
             quiet_ticks = 0;
@@ -321,7 +330,6 @@ int main(int argc, char** argv) {
             // Start recording as soon as the hotkey is pressed.
             active = true;
             from_s = 0.0;
-            last_decode_s = -1;
             committed_all.clear();
             pending.clear();
             quiet_ticks = 0;
@@ -330,8 +338,8 @@ int main(int argc, char** argv) {
             corrector.start();
             Logger::log("MAIN", "===== RECORDING (release Win+Space to stop) =====");
         } else if (hot == 2 && active) {
-            // Release finalizes the utterance: catch the last ~1s of audio
-            // with a forced decode pass, then drain the corrector.
+            // Release finalizes the utterance: transcribe whatever tail of the
+            // current chunk remains, then drain the corrector.
             Logger::log("MAIN", "===== STOPPING =====");
             double now_s = (double)recorder.sample_count() / kSampleRate;
             if (now_s - from_s >= 0.5) run_decode(true);
@@ -348,13 +356,13 @@ int main(int argc, char** argv) {
 
         if (active) {
             double now_s = (double)recorder.sample_count() / kSampleRate;
-            double region = now_s - from_s;
 
-            if (region < min_region_s
-                || (last_decode_s >= 0 && now_s - last_decode_s < cadence_s)) {
-                this_thread::sleep_for(chrono::milliseconds(50));
-            } else {
+            // A full chunk is ready: transcribe it (recorder keeps capturing
+            // the next chunk concurrently). Otherwise wait for more audio.
+            if (now_s - from_s >= kChunkSeconds) {
                 run_decode(false);
+            } else {
+                this_thread::sleep_for(chrono::milliseconds(50));
             }
         } else {
             this_thread::sleep_for(chrono::milliseconds(5));
