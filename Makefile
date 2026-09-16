@@ -14,19 +14,23 @@ LDFLAGS := -lpthread -ldl -lm
 INCLUDES := $(WHISPER_INCLUDES) $(LLAMA_INCLUDES)
 
 TARGET := voice_pipeline
+TARGETS := $(TARGET) dictatd
 SRCS := main.cpp logger.cpp timer.cpp audio.cpp transcribe.cpp grammar.cpp
 OBJS := $(SRCS:.cpp=.o)
 
 .PHONY: all clean check help
 
-all: $(TARGET)
+all: $(TARGETS)
 
 $(TARGET): $(OBJS)
 	$(CXX) $(OBJS) -o $(TARGET) $(WHISPER_LIBS) $(LLAMA_LIBS) $(RPATH) $(LDFLAGS)
+
+dictatd: dictatd.o
+	$(CXX) dictatd.o -o dictatd
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 clean:
-	rm -f $(TARGET) $(OBJS)
+	rm -f $(TARGETS) $(OBJS)
 
