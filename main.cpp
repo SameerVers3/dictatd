@@ -9,6 +9,13 @@
 #include <chrono>
 #include <cmath>
 #include <algorithm>
+#include <cstring>
+#include <cstdio>
+#include <fcntl.h>
+#include <dirent.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/input.h>
 #include "logger.h"
 #include "timer.h"
 #include "audio.h"
@@ -25,6 +32,87 @@ void signal_handler(int) {
 
 static const int kSampleRate = 16000;
 
+// Polls all /dev/input/event* keyboards for the Win+Space hotkey.
+class HotkeyListener {
+public:
+    ~HotkeyListener() { close(); }
+
+    bool open() {
+        DIR* dir = opendir("/dev/input");
+        if (!dir) {
+            perror("opendir /dev/input");
+            return false;
+        }
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            if (strncmp(entry->d_name, "event", 5) != 0) continue;
+            string path = "/dev/input/" + string(entry->d_name);
+            int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK);
+            if (fd < 0) continue;
+            if (is_keyboard(fd)) {
+                fds_.push_back(fd);
+                Logger::log("HOTKEY", "Monitoring " + path);
+            } else {
+                ::close(fd);
+            }
+        }
+        closedir(dir);
+        if (fds_.empty()) {
+            Logger::log("HOTKEY", "ERROR: no keyboards found");
+            return false;
+        }
+        return true;
+    }
+
+    // Polls hotkey state. Returns 1 when the hotkey goes down, 2 when it
+    // comes back up, or 0 when nothing changed.
+    int poll() {
+        int result = 0;
+        for (int fd : fds_) {
+            struct input_event ev;
+            while (read(fd, &ev, sizeof(ev)) == sizeof(ev)) {
+                if (ev.type != EV_KEY) continue;
+                if (ev.code == KEY_LEFTMETA || ev.code == KEY_RIGHTMETA) {
+                    if (down_ && ev.value == 0 && result == 0) {
+                        // Super lifted while we were recording.
+                        down_ = false;
+                        result = 2;
+                    }
+                    super_down_ = (ev.value == 1 || ev.value == 2);
+                }
+                if (ev.code == KEY_SPACE) {
+                    if (ev.value == 0) {
+                        if (down_ && result == 0) {
+                            down_ = false;
+                            result = 2;
+                        }
+                    } else if (super_down_ && !down_ && result == 0) {
+                        down_ = true;
+                        result = 1;
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    void close() {
+        for (int fd : fds_) ::close(fd);
+        fds_.clear();
+    }
+
+private:
+    static bool is_keyboard(int fd) {
+        unsigned long evbit = 0;
+        if (ioctl(fd, EVIOCGBIT(0, sizeof(evbit)), &evbit) < 0) return false;
+        return (evbit & (1UL << EV_KEY)) != 0;
+    }
+
+    vector<int> fds_;
+    bool super_down_ = false;
+    bool down_ = false;
+};
+
 // Applies grammar correction on a background thread so decoding of the next
 // audio region is never blocked by the corrector.
 class CorrectionWorker {
@@ -34,6 +122,10 @@ public:
     ~CorrectionWorker() { stop(); }
 
     void start() {
+        {
+            lock_guard<mutex> lock(mtx_);
+            done_ = false;
+        }
         th_ = thread([this] { run(); });
     }
 
@@ -94,44 +186,32 @@ static string prompt_context(const string& all, size_t max_chars) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        cerr << "Usage: " << argv[0] << " <whisper_model> <llama_model> "
-             << "[min_region_seconds] [cadence_seconds] [settle_seconds]\n\n"
-             << "Streams the microphone with a growing decode region.\n"
-             << "The decode region always starts at the committed frontier and\n"
-             << "grows on the tail as new audio arrives. Each pass commits every\n"
-             << "segment that has settled (ended before now - settle_seconds) and\n"
-             << "re-decodes only the unsettled tail with more future context, so\n"
-             << "output streams at ~cadence speed while every word is verified.\n\n"
+        cerr << "Usage: " << argv[0] << " <whisper_model> <llama_model>\n\n"
+             << "Models are loaded once at startup. Hold Win+Space to dictate;\n"
+             << "audio is transcribed (and grammar-corrected) while held, and\n"
+             << "the utterance is finalized when you release the keys.\n\n"
              << "Arguments:\n"
-             << "  whisper_model   Path to whisper.cpp model (tiny.en for ~realtime)\n"
-             << "  llama_model     Path to llama.cpp GGUF model for grammar correction\n"
-             << "  min_region      Min audio before the first decode (default: 3)\n"
-             << "  cadence         Min seconds between decode passes (default: 2)\n"
-             << "  settle          Tail margin held back for re-decoding (default: 0.4)\n";
+             << "  whisper_model   Path to whisper.cpp model\n"
+             << "  llama_model     Path to llama.cpp GGUF model for grammar correction\n";
         return 1;
     }
     string whisper_model = argv[1];
     string llama_model = argv[2];
-    double min_region_s = (argc > 3) ? atof(argv[3]) : 3.0;
-    double cadence_s = (argc > 4) ? atof(argv[4]) : 2.0;
-    double settle_s = (argc > 5) ? atof(argv[5]) : 0.4;
 
-    if (min_region_s < 1.0) min_region_s = 1.0;
-    if (cadence_s < 0.5) cadence_s = 0.5;
-    if (settle_s < 0.2) settle_s = 0.2;
+    // Tunables for the streaming decode loop.
+    const double min_region_s = 1.0;
+    const double cadence_s = 1.5;
+    const double settle_s = 0.4;
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     Logger::log("MAIN", "========================================");
-    Logger::log("MAIN", "Voice Pipeline Starting (streaming)");
+    Logger::log("MAIN", "Dictation Daemon (hotkey toggled)");
     Logger::log("MAIN", "Whisper model: " + whisper_model);
     Logger::log("MAIN", "LLama model:   " + llama_model);
-    Logger::log("MAIN", "min region: " + to_string(min_region_s) + "s, "
-                        "cadence: " + to_string(cadence_s) + "s, "
-                        "settle: " + to_string(settle_s) + "s");
-    Logger::log("MAIN", "Press Ctrl+C to stop");
     Logger::log("MAIN", "========================================");
 
+    // Load both models up front, before the hotkey loop starts.
     WhisperEngine whisper;
     if (!whisper.init(whisper_model)) {
         Logger::log("MAIN", "FATAL: failed to load whisper model");
@@ -144,16 +224,19 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Ring keeps enough history for the region to grow between commits.
-    AudioRecorder recorder(kSampleRate, 20);
-    if (!recorder.start()) {
-        Logger::log("MAIN", "FATAL: failed to start recorder");
+    HotkeyListener hotkey;
+    if (!hotkey.open()) {
+        Logger::log("MAIN", "FATAL: no keyboard device available");
         return 1;
     }
 
-    CorrectionWorker corrector(&llama);
-    corrector.start();
+    Logger::log("MAIN", "Models loaded. Hold Win+Space to dictate; "
+                        "release to stop.");
 
+    AudioRecorder recorder(kSampleRate, 20);
+    CorrectionWorker corrector(&llama);
+
+    bool active = false;
     double from_s = 0.0;        // committed frontier, seconds
     double last_decode_s = -1;  // last time we ran a decode pass
     string committed_all;       // rolling text of everything committed so far
@@ -161,15 +244,13 @@ int main(int argc, char** argv) {
     int quiet_ticks = 0;
     uint64_t n_ticks = 0;
 
-    while (g_running) {
+    // One streaming decode pass. A pass commits every settled segment and
+    // re-decodes only the unsettled tail with more future context. With
+    // force=true (used when stopping a session) every segment is committed so
+    // nothing in the utterance is lost.
+    auto run_decode = [&](bool force) {
         double now_s = (double)recorder.sample_count() / kSampleRate;
         double region = now_s - from_s;
-
-        // Need some audio, and (except startup) respect the cadence.
-        if (region < min_region_s || (last_decode_s >= 0 && now_s - last_decode_s < cadence_s)) {
-            this_thread::sleep_for(chrono::milliseconds(50));
-            continue;
-        }
         last_decode_s = now_s;
         n_ticks++;
 
@@ -182,17 +263,16 @@ int main(int argc, char** argv) {
         auto segs = whisper.transcribe(clip.samples, clip.sample_rate,
                                        prompt_context(committed_all, 300));
 
-        double threshold = now_s - settle_s;
+        double threshold = force ? now_s : (now_s - settle_s);
         string new_text;
         double new_from = from_s;
 
         for (const auto& sg : segs) {
-            double b = from_s + sg.t0;
             double e = from_s + sg.t1;
 
             // Only settled segments are committed; the tail is re-decoded next
             // pass once more future audio exists.
-            if (e > threshold) continue;
+            if (!force && e > threshold) continue;
 
             if (!new_text.empty() && sg.text[0] != '.' && sg.text[0] != ','
                 && sg.text[0] != '!' && sg.text[0] != '?' && sg.text[0] != ';') {
@@ -203,12 +283,12 @@ int main(int argc, char** argv) {
         }
 
         // Skip dead air so the region doesn't grow unbounded during silence.
-        if (new_text.empty() && segs.empty() && region > 8.0) {
+        if (!force && new_text.empty() && segs.empty() && region > 8.0) {
             new_from = now_s;
         }
         // During continuous speech with no paused segments, bound the region
         // so decode cost (and latency) can't grow without limit.
-        if (new_text.empty() && !segs.empty() && region > 12.0) {
+        if (!force && new_text.empty() && !segs.empty() && region > 12.0) {
             new_from = now_s - settle_s;
         }
         from_s = new_from;
@@ -233,14 +313,62 @@ int main(int argc, char** argv) {
             corrector.submit(pending);
             pending.clear();
         }
+    };
+
+    while (g_running) {
+        int hot = hotkey.poll();
+        if (hot == 1 && !active) {
+            // Start recording as soon as the hotkey is pressed.
+            active = true;
+            from_s = 0.0;
+            last_decode_s = -1;
+            committed_all.clear();
+            pending.clear();
+            quiet_ticks = 0;
+            n_ticks = 0;
+            recorder.start();
+            corrector.start();
+            Logger::log("MAIN", "===== RECORDING (release Win+Space to stop) =====");
+        } else if (hot == 2 && active) {
+            // Release finalizes the utterance: catch the last ~1s of audio
+            // with a forced decode pass, then drain the corrector.
+            Logger::log("MAIN", "===== STOPPING =====");
+            double now_s = (double)recorder.sample_count() / kSampleRate;
+            if (now_s - from_s >= 0.5) run_decode(true);
+            if (!pending.empty()) {
+                Logger::log("MAIN", "Sending final text to grammar corrector");
+                corrector.submit(pending);
+                pending.clear();
+            }
+            corrector.stop();
+            recorder.shutdown();
+            active = false;
+            Logger::log("MAIN", "===== DICTATION DONE =====");
+        }
+
+        if (active) {
+            double now_s = (double)recorder.sample_count() / kSampleRate;
+            double region = now_s - from_s;
+
+            if (region < min_region_s
+                || (last_decode_s >= 0 && now_s - last_decode_s < cadence_s)) {
+                this_thread::sleep_for(chrono::milliseconds(50));
+            } else {
+                run_decode(false);
+            }
+        } else {
+            this_thread::sleep_for(chrono::milliseconds(5));
+        }
     }
 
-    if (!pending.empty()) {
-        corrector.submit(pending);
+    // Shutdown on signal: tear down any active session.
+    if (active) {
+        double now_s = (double)recorder.sample_count() / kSampleRate;
+        if (now_s - from_s >= 0.5) run_decode(true);
+        if (!pending.empty()) corrector.submit(pending);
+        corrector.stop();
+        recorder.shutdown();
     }
-
-    corrector.stop();
-    recorder.shutdown();
 
     cout << "\n";
     Logger::log("MAIN", "Shutdown signal received. Exiting...");

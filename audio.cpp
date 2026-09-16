@@ -19,7 +19,16 @@ AudioRecorder::~AudioRecorder() {
 }
 
 bool AudioRecorder::start() {
-    if (worker_.joinable()) return true;
+    {
+        lock_guard<mutex> lock(mtx_);
+        if (worker_.joinable()) return true;
+        // Reset state from any previous recording session so each start()
+        // begins a fresh timeline and an empty ring.
+        samples_.clear();
+        total_ = 0;
+        stop_ = false;
+        ok_ = false;
+    }
     worker_ = thread([this] { worker(); });
     Logger::log("RECORD", "Continuous recorder started ("
                 + to_string(sample_rate_) + " Hz, ring "
