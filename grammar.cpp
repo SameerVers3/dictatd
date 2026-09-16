@@ -47,7 +47,6 @@ bool LlamaCorrector::init(const string& model_path) {
 
     ctx_params.n_ctx = 4096;
     ctx_params.n_batch = 512;
-    n_threads_ = 3;
     ctx_params.n_threads = n_threads_;
     ctx_params.n_threads_batch = n_threads_;
 

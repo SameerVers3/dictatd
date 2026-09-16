@@ -16,6 +16,7 @@ class WhisperEngine {
 public:
     ~WhisperEngine();
     bool init(const string& model_path);
+    void set_threads(int n) { n_threads_ = n; }
     bool initialized() const { return ctx_ != nullptr; }
     // Transcribe raw 16 kHz audio. context_text carries previously committed
     // words into the decoder so consecutive sliding windows stay coherent.
@@ -25,5 +26,5 @@ public:
 
 private:
     struct whisper_context* ctx_ = nullptr;
-    int n_threads_ = 1;
+    int n_threads_ = 3;
 };

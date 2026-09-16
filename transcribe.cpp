@@ -26,7 +26,6 @@ bool WhisperEngine::init(const string& model_path) {
         return false;
     }
 
-    n_threads_ = 3;
     Logger::log("WHISPER", "Model loaded. Inference will use "
                 + to_string(n_threads_) + " threads.");
     return true;

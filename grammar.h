@@ -8,6 +8,7 @@ class LlamaCorrector {
 public:
     ~LlamaCorrector();
     bool init(const string& model_path);
+    void set_threads(int n) { n_threads_ = n; }
     bool initialized() const { return model_ != nullptr && ctx_ != nullptr; }
     string correct(const string& raw_text);
 
@@ -17,5 +18,5 @@ private:
     const struct llama_vocab* vocab_ = nullptr;
     struct llama_sampler* sampler_ = nullptr;
     bool backend_inited_ = false;
-    int n_threads_ = 1;
+    int n_threads_ = 3;
 };
